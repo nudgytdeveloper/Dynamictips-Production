@@ -1,16 +1,27 @@
 import pymongo
-import google.generativeai as genai
-from datetime import datetime
+from google import genai
+from google.genai import types as genai_types
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 import os
+import sys
+import threading
+import time
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse, unquote, quote, urlsplit, urlunsplit
 from bson import ObjectId
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Render captures stdout through a pipe, where Python block-buffers it: every
+# print of a request used to surface in one clump at the end, so the per-stage
+# timing lines below would say nothing about *when* each stage ran.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 MONGO_URI              = os.environ.get("MONGO_URI")
 DB_NAME                = os.environ.get("DB_NAME", "your_db_name")
@@ -21,14 +32,32 @@ SIMULATIONS_COLLECTION    = os.environ.get("SIMULATIONS_COLLECTION", "simulation
 SERVICE_LEVELS_COLLECTION = os.environ.get("SERVICE_LEVELS_COLLECTION", "service_levels")
 GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY")
 
+# ============================================================================
+# Response time ("Optimize speed of AI Tips Agent").
+#
+# Staging measured a 9.4 s median / 12.4 s p90 per /tips call (2026-08-25 →
+# 08-31), the same with or without an SOP file — so the cost was not the
+# download but the model: gemini-2.5-flash reasons before it answers unless
+# told not to, and for a single ≤500-character tip that reasoning was most of
+# the wait. The budget below turns it off. It is env-tunable so it can be
+# raised from the Render dashboard, without a deploy, if tip quality ever
+# needs it back. The legacy google-generativeai SDK could not set this at
+# all, which is why the agent now uses google-genai.
+# ============================================================================
+GEMINI_MODEL             = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_THINKING_BUDGET   = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
+# Bounds a hung generation; the old client would wait on it indefinitely.
+GEMINI_TIMEOUT_SECONDS   = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "60"))
+GEMINI_TEMPERATURE       = 0.5
+# Thinking tokens (when a budget is set) are charged against this cap too.
+GEMINI_MAX_OUTPUT_TOKENS = 3000
+
 client                 = pymongo.MongoClient(MONGO_URI)
 db                     = client[DB_NAME]
 transcripts_collection = db[TRANSCRIPTS_COLLECTION]
 tips_collection        = db[TIPS_COLLECTION]
 simulations_collection    = db[SIMULATIONS_COLLECTION]
 service_levels_collection = db[SERVICE_LEVELS_COLLECTION]
-
-genai.configure(api_key=GEMINI_API_KEY)
 
 # --- transcript speaker labels -------------------------------------------
 # These MUST match the labels the prompt tells the model to look for. They
@@ -39,6 +68,53 @@ FROM_TYPE_USER      = "User"
 FROM_TYPE_CHARACTER = "Character"
 SPEAKER_HUMAN       = "HUMAN USER"
 SPEAKER_AI          = "AI CHARACTER"
+
+_gemini_client: Optional[genai.Client] = None
+_gemini_client_lock = threading.Lock()
+
+
+def gemini_client() -> genai.Client:
+    """One shared client, built on first use so a missing key fails the request, not the boot."""
+    global _gemini_client
+    with _gemini_client_lock:
+        if _gemini_client is None:
+            if not GEMINI_API_KEY:
+                raise RuntimeError("GEMINI_API_KEY is not set")
+            _gemini_client = genai.Client(
+                api_key=GEMINI_API_KEY,
+                http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_SECONDS * 1000),
+            )
+        return _gemini_client
+
+
+def response_text(response: Any) -> str:
+    """Text of a Gemini response, or "" — never an exception.
+
+    `response.text` is None when the candidate carries no text part (a safety
+    block, or a MAX_TOKENS stop where the budget went to thinking); walk the
+    parts before giving up so a partial answer is not thrown away.
+    """
+    try:
+        text = response.text
+        if text:
+            return text.strip()
+    except Exception as e:
+        print(f"[DEBUG] Gemini response exposed no .text ({e}); reading parts")
+
+    chunks = []
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            text = getattr(part, "text", None)
+            if text:
+                chunks.append(text)
+    return "".join(chunks).strip()
+
+
+def finish_reason(response: Any) -> str:
+    candidates = getattr(response, "candidates", None) or []
+    reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+    return str(getattr(reason, "name", reason) or "unknown")
 
 
 # ============================================================================
@@ -51,8 +127,6 @@ SPEAKER_AI          = "AI CHARACTER"
 #
 # The field is optional: with no SOP configured (or an unusable one) this agent
 # generates exactly the same generic communication-coaching tips it always has.
-# Note the upload UI shipped on staging first, so on production this is expected
-# to be a no-op until the feature is promoted.
 # ============================================================================
 SNAPSHOT_KEY          = "dependency_snapshot"
 SIM_SERVICE_LEVEL_KEY = "service_level"
@@ -134,6 +208,84 @@ def get_sop_tips_file_url(simulation: Dict[str, Any]) -> Optional[str]:
     return _first_file_url(service_level_doc.get(SOP_TIPS_FILE_KEY))
 
 
+# --- Continuous Learning (Block D) consumer helper — pasted verbatim from continous-learning-agent/README.md ---
+CL_INSTRUCTIONS_COLLECTION = os.environ.get("CL_INSTRUCTIONS_COLLECTION", "agent_learner_instructions")
+CL_BEHAVIOR_CHANGES_COLLECTION = "agent_behavior_changes"
+CL_SIM_LEARNER_KEYS = ("learner", "user", "learner_id", "user_id")
+CL_ACTIVE_STATUSES = ("approved", "applied")
+CL_STATUS_APPLIED = "applied"
+CL_AGENT_NAME = "tips"
+FIELD_CL_INSTRUCTION_ID = "cl_instruction_id"
+FIELD_CL_INSTRUCTION_VERSION = "cl_instruction_version"
+FIELD_CL_STAGE = "cl_stage"
+CL_ABSENT_BLOCK = """
+            No prior-session background is available for this learner; treat this as a standalone session and do not refer to previous sessions.
+            """
+
+
+def get_learner_instruction(simulation):
+    """Active Continuous-Learning instruction for this simulation's learner, or None. Never raises."""
+    try:
+        learner_id = next((simulation.get(k) for k in CL_SIM_LEARNER_KEYS if simulation and simulation.get(k) is not None), None)
+        if learner_id is None:
+            return None
+        ids = [learner_id, str(learner_id)]
+        try:
+            ids.append(ObjectId(str(learner_id)))
+        except Exception:
+            pass
+        doc = db[CL_INSTRUCTIONS_COLLECTION].find_one(
+            {"learner_id": {"$in": ids}, "status": {"$in": list(CL_ACTIVE_STATUSES)}}, sort=[("version", -1)])
+        if not doc or not doc.get("instruction"):
+            return None
+        target = doc.get("for_service_level")
+        if target and simulation.get("service_level") is not None and str(target) != str(simulation.get("service_level")):
+            return None  # written for another scenario; the worker refreshes it when this one starts
+        return doc
+    except Exception as e:
+        print(f"[DEBUG] CL instruction lookup failed: {e}")
+        return None
+
+
+def learner_instruction_block(doc):
+    """Prompt block with an explicit empty case (same discipline as tips_instruction)."""
+    if doc and doc.get("instruction"):
+        hint = (doc.get("per_agent") or {}).get(CL_AGENT_NAME) or ""
+        return f"""
+            Background on this learner from their previous sessions (private; follow it, never quote or mention it):
+            ---
+            {doc["instruction"]}
+            {hint}
+            ---
+            """
+    return CL_ABSENT_BLOCK
+
+
+def cl_provenance(doc):
+    return {FIELD_CL_INSTRUCTION_ID: doc.get("_id") if doc else None,
+            FIELD_CL_INSTRUCTION_VERSION: doc.get("version") if doc else None,
+            FIELD_CL_STAGE: doc.get("stage") if doc else None}
+
+
+def cl_mark_applied(doc, simulation_id):
+    """Audit trail: this agent used the instruction for this simulation. Never raises."""
+    if not doc:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        db[CL_INSTRUCTIONS_COLLECTION].update_one({"_id": doc["_id"], "applied_at": None}, {"$set": {"applied_at": now}})
+        db[CL_INSTRUCTIONS_COLLECTION].update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"status": CL_STATUS_APPLIED},
+             "$push": {"applied": {"agent": CL_AGENT_NAME, "simulation_id": str(simulation_id), "at": now}}})
+        db[CL_BEHAVIOR_CHANGES_COLLECTION].update_one(
+            {"instruction_id": doc["_id"], "agent": CL_AGENT_NAME, "applied_at": None},
+            {"$set": {"applied_at": now, "applied_simulation_id": str(simulation_id)}})
+    except Exception as e:
+        print(f"[DEBUG] CL mark-applied failed: {e}")
+# --- end Continuous Learning consumer helper ---
+
+
 def _encode_url(url: str) -> str:
     """Percent-encode the path/query of a URL.
 
@@ -205,6 +357,58 @@ def fetch_sop_document(url: str) -> Optional[Dict[str, Any]]:
         return None
     return {"url": url, "text": text}
 
+
+# ── SOP download cache ────────────────────────────────────────────────────
+# Every /tips call for a service used to download its SOP again — the same
+# PDF, up to 15 MB, on every request. The file is cached per URL for a
+# bounded time so a session's second and later tips skip the download. An
+# unusable result (unreachable, oversized, wrong type) is cached too, but
+# only briefly, so a transient outage does not cost ten minutes of SOP-less
+# tips. Keyed on the URL alone: an admin re-uploading under the *same*
+# filename is served the old file until the entry expires.
+SOP_CACHE_TTL_SECONDS         = int(os.environ.get("SOP_CACHE_TTL_SECONDS", "600"))
+SOP_CACHE_FAILURE_TTL_SECONDS = int(os.environ.get("SOP_CACHE_FAILURE_TTL_SECONDS", "60"))
+SOP_CACHE_MAX_ENTRIES         = 32
+
+_sop_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
+_sop_cache_lock = threading.Lock()
+
+
+def get_sop_document(url: str) -> Optional[Dict[str, Any]]:
+    """`fetch_sop_document`, memoised per URL. Same contract: never raises."""
+    now = time.monotonic()
+    with _sop_cache_lock:
+        entry = _sop_cache.get(url)
+        if entry and now < entry[0]:
+            return entry[1]
+
+    document = fetch_sop_document(url)
+    ttl = SOP_CACHE_TTL_SECONDS if document else SOP_CACHE_FAILURE_TTL_SECONDS
+
+    with _sop_cache_lock:
+        if len(_sop_cache) >= SOP_CACHE_MAX_ENTRIES:
+            for key in [k for k, (expires_at, _) in _sop_cache.items() if expires_at <= now]:
+                del _sop_cache[key]
+        if len(_sop_cache) >= SOP_CACHE_MAX_ENTRIES:
+            del _sop_cache[min(_sop_cache, key=lambda k: _sop_cache[k][0])]
+        _sop_cache[url] = (now + ttl, document)
+    return document
+
+
+def resolve_sop_document(simulation_id: str,
+                         simulation: Dict[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """(file URL, Gemini-ready document) for the simulation's service, either half None if absent."""
+    sop_file_url = get_sop_tips_file_url(simulation)
+    if not sop_file_url:
+        print(f"No SOP file configured for simulation {simulation_id}")
+        return None, None
+    print(f"SOP file for simulation {simulation_id}: {sop_file_url}")
+    sop_document = get_sop_document(sop_file_url)
+    if not sop_document:
+        print(f"SOP file unusable for simulation {simulation_id}; falling back to a generic tip")
+    return sop_file_url, sop_document
+
+
 app = FastAPI(title="Dynamic Tips API")
 app.add_middleware(
     CORSMiddleware,
@@ -227,11 +431,14 @@ class TipsResponse(BaseModel):
     # callers that ignore these fields keep working unchanged.
     sop_applied: bool = False
     sop_file_url: str | None = None
+    # Whether a Continuous Learning instruction for this learner shaped the tip.
+    cl_applied: bool = False
+    # Wall-clock time the agent spent on this request, so response time can be
+    # read off the payload instead of inferred from the caller's stopwatch.
+    duration_ms: int | None = None
 
 class DynamicTips:
-    def __init__(self):
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
- 
+
     # ── 1. Fetch all transcripts for a simulation ──────────────────────────
     def get_transcripts_by_simulation(self, simulation_id: str) -> List[Dict[Any, Any]]:
         """
@@ -285,7 +492,8 @@ class DynamicTips:
  
     # ── 3. Call Gemini to generate tips ────────────────────────────────────
     def generate_tips(self, transcript: str,
-                      sop_document: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None]:
+                      sop_document: Optional[Dict[str, Any]] = None,
+                      learner_instruction: Optional[Dict[str, Any]] = None) -> Tuple[str, str | None]:
         try:
             # When the service has an SOP / best-practice document attached, the
             # tip is drawn from that document's specific instructions instead of
@@ -315,6 +523,7 @@ class DynamicTips:
             prompt = f"""
             You are a communication coach helping learners in Singapore improve their interpersonal effectiveness.
             {sop_instruction}
+            {learner_instruction_block(learner_instruction)}
             Analyze ONLY the "HUMAN USER" messages in this conversation transcript:
             {transcript}
 
@@ -338,46 +547,50 @@ class DynamicTips:
             """
 
             # A PDF SOP rides along as inline data; a text SOP is already in the prompt.
+            contents: List[Any] = []
             if sop_document and sop_document.get("data"):
-                content = [
-                    {"mime_type": sop_document["mime_type"], "data": sop_document["data"]},
-                    prompt,
-                ]
-            else:
-                content = prompt
+                contents.append(genai_types.Part.from_bytes(
+                    data=sop_document["data"], mime_type=sop_document["mime_type"]))
+            contents.append(prompt)
 
-            response = self.model.generate_content(
-                content,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.5,
-                    max_output_tokens=3000,
+            response = gemini_client().models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    temperature=GEMINI_TEMPERATURE,
+                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                    thinking_config=genai_types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET),
                 ),
             )
- 
-            tips_text = response.text.strip()
+
+            tips_text = response_text(response)
+            if not tips_text:
+                return "", f"Error generating tips: Gemini returned no text (finish_reason={finish_reason(response)})"
 
             # FIX: Split on double newlines so each full tip block is one list item,
             # rather than splitting on every newline which fragments tips into individual lines.
             tips = "\n\n".join(block.strip() for block in tips_text.split("\n\n") if block.strip())
             return tips, None
- 
+
         except Exception as e:
             # FIX: return a str, not []. TipsResponse.tips is typed `str`, so the
             # old `return []` made every generation failure a pydantic validation
             # error (HTTP 500) instead of a clean error payload.
             return "", f"Error generating tips: {e}"
-
+ 
     # ── 4. Persist tips to MongoDB ─────────────────────────────────────────
     def save_tips_to_mongodb(self, simulation_id: str, tips: List[str],
                              sop_file_url: Optional[str] = None,
-                             sop_applied: bool = False) -> bool:
+                             sop_applied: bool = False,
+                             learner_instruction: Optional[Dict[str, Any]] = None) -> bool:
         try:
             timestamp   = datetime.now()
             # Each entry records the SOP it came from, so a tip can be traced back
             # to the document that produced it.
             tip_entries = [{"tip": tip, "timestamp": timestamp,
                             "sop_file_url": sop_file_url,
-                            "sop_applied": sop_applied} for tip in tips]
+                            "sop_applied": sop_applied,
+                            **cl_provenance(learner_instruction)} for tip in tips]
 
             result = tips_collection.update_one(
                 {"simulation_id": simulation_id},
@@ -391,15 +604,36 @@ class DynamicTips:
                 upsert=True,
             )
             return result.acknowledged
- 
+
         except Exception as e:
             print(f"Error saving tips to MongoDB: {e}")
             return False
- 
+
     # ── 5. Orchestrate the full pipeline ───────────────────────────────────
-    def process_simulation(self, simulation_id: str) -> Dict[str, Any]:
-        transcripts = self.get_transcripts_by_simulation(simulation_id)
- 
+    def process_simulation(self, simulation_id: str,
+                           background_tasks: Optional[BackgroundTasks] = None) -> Dict[str, Any]:
+        """Generate, persist and return one tip for the simulation.
+
+        The reads that do not depend on each other run side by side, and the
+        Continuous Learning audit writes (three updates that only record that
+        the instruction was used) run after the response has gone out when a
+        `background_tasks` is supplied. Each stage's time is logged in one
+        line per request, so a slow call can be attributed at a glance.
+        """
+        started = time.perf_counter()
+        timings: Dict[str, int] = {}
+
+        def lap(stage: str) -> None:
+            timings[stage] = int((time.perf_counter() - started) * 1000) - sum(timings.values())
+
+        # Transcripts and the simulation document are independent lookups.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            transcripts_future = pool.submit(self.get_transcripts_by_simulation, simulation_id)
+            simulation_future  = pool.submit(get_simulation, simulation_id)
+            transcripts = transcripts_future.result()
+            simulation  = simulation_future.result()
+        lap("lookup")
+
         if not transcripts:
             return {
                 "simulation_id": simulation_id,
@@ -408,29 +642,32 @@ class DynamicTips:
                 "saved_to_db": False,
                 "timestamp": datetime.now().isoformat(),
                 "error": "No transcripts found for this simulation.",
+                "duration_ms": int((time.perf_counter() - started) * 1000),
             }
- 
-        # Optional SOP grounding. A missing simulation, missing field, or unusable
-        # file is not an error — the tip is simply generated the generic way.
+
+        # Optional SOP grounding and Continuous Learning context. A missing
+        # simulation, missing field, or unusable file is not an error — the tip
+        # is simply generated the generic way. The two are independent of each
+        # other, so the CL lookup overlaps the SOP download.
         sop_document = None
         sop_file_url = None
-        simulation = get_simulation(simulation_id)
+        learner_instruction = None
         if simulation:
-            sop_file_url = get_sop_tips_file_url(simulation)
-            if sop_file_url:
-                print(f"SOP file for simulation {simulation_id}: {sop_file_url}")
-                sop_document = fetch_sop_document(sop_file_url)
-                if not sop_document:
-                    print(f"SOP file unusable for simulation {simulation_id}; "
-                          f"falling back to a generic tip")
-            else:
-                print(f"No SOP file configured for simulation {simulation_id}")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                instruction_future = pool.submit(get_learner_instruction, simulation)
+                sop_future         = pool.submit(resolve_sop_document, simulation_id, simulation)
+                learner_instruction        = instruction_future.result()
+                sop_file_url, sop_document = sop_future.result()
+            if learner_instruction:
+                print(f"CL instruction for simulation {simulation_id}: {learner_instruction.get('stage')} v{learner_instruction.get('version')}")
         else:
             print(f"Simulation {simulation_id} not found in {SIMULATIONS_COLLECTION}; "
                   f"generating a generic tip")
+        lap("context")
 
         combined    = self.combine_transcripts(transcripts)
-        tips, error = self.generate_tips(combined, sop_document)
+        tips, error = self.generate_tips(combined, sop_document, learner_instruction)
+        lap("gemini")
 
         saved = False
         if tips:
@@ -438,7 +675,22 @@ class DynamicTips:
                 simulation_id, [tips],
                 sop_file_url=sop_file_url,
                 sop_applied=bool(sop_document),
+                learner_instruction=learner_instruction,
             )
+            if saved and learner_instruction:
+                if background_tasks is not None:
+                    background_tasks.add_task(cl_mark_applied, learner_instruction, simulation_id)
+                else:
+                    cl_mark_applied(learner_instruction, simulation_id)
+        lap("save")
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        print(f"Tips for simulation {simulation_id}: {duration_ms}ms "
+              f"(lookup={timings['lookup']} context={timings['context']} "
+              f"gemini={timings['gemini']} save={timings['save']}) "
+              f"transcripts={len(transcripts)} sop={bool(sop_document)} cl={bool(learner_instruction)} "
+              f"model={GEMINI_MODEL} thinking_budget={GEMINI_THINKING_BUDGET}"
+              + (f" error={error}" if error else ""))
 
         return {
             "simulation_id":    simulation_id,
@@ -449,23 +701,25 @@ class DynamicTips:
             "error":            error,
             "sop_applied":      bool(sop_document),
             "sop_file_url":     sop_file_url,
+            "cl_applied":       bool(learner_instruction),
+            "duration_ms":      duration_ms,
         }
 
-advisor = DynamicTips() 
+advisor = DynamicTips()
 
 @app.get("/health")
 def health_check():
     """Simple liveness probe."""
     return {"status": "ok"}
- 
+
 
 @app.post("/tips", response_model=TipsResponse)
-def get_tips(request: TipsRequest):
+def get_tips(request: TipsRequest, background_tasks: BackgroundTasks):
     try:
         if not request.simulation_id:
             raise HTTPException(status_code=400, detail="simulation_id is required.")
-        
-        result = advisor.process_simulation(request.simulation_id)
+
+        result = advisor.process_simulation(request.simulation_id, background_tasks)
         return result
 
     except HTTPException:
@@ -477,13 +731,13 @@ def get_tips(request: TipsRequest):
 
 
 @app.post("/tips/{simulation_id}", response_model=TipsResponse)
-def get_tips_by_id(simulation_id: str):
+def get_tips_by_id(simulation_id: str, background_tasks: BackgroundTasks):
     """
     Convenience POST endpoint — same behaviour as /tips but with
     simulation_id in the URL path instead of the request body.
     """
-    result = advisor.process_simulation(simulation_id)
- 
+    result = advisor.process_simulation(simulation_id, background_tasks)
+
     if result.get("error") and not result.get("tips"):
         raise HTTPException(status_code=502, detail=result["error"])
  
@@ -510,4 +764,4 @@ def debug_raw(simulation_id: str):
 if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("dynamic_tips_api:app", host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
