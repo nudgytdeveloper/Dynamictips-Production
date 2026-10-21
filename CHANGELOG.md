@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-21
+
+### Added
+- `/tips` accepts an optional `is_requested` (body, or query parameter on `/tips/{simulation_id}`), stored on each tip entry and echoed in the response; defaults to `false`, which shows the notification bell (ported from staging)
+
+### Fixed
+- New tip documents store `simulation_id` as an ObjectId, which the platform reads; tips for a simulation are appended to its existing document whether it is keyed by an ObjectId or the older string (ported from staging)
+
 ## 2026-10-16
 
 ### Added
