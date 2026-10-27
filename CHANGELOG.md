@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-27
+
+### Fixed
+- `anchor_quote` is filled for short learner messages such as "hello", which were below the 8-character minimum meant only for searching every message; quotes now match whole words (task 295, ported from staging)
+- When the model corrects the learner's typos while quoting, the closest run of the learner's own words in the named message is stored as `anchor_quote`, in their spelling (task 295, ported from staging)
+
+### Changed
+- The prompt asks for the anchor quote character for character, keeping spelling mistakes
+
 ## 2026-10-21
 
 ### Added
